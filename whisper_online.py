@@ -10,6 +10,8 @@ import io
 import soundfile as sf
 import math
 
+from hypothesis_buffer import HypothesisBuffer, HypothesisBufferN
+
 logger = logging.getLogger(__name__)
 
 @lru_cache(10**6)
@@ -354,89 +356,22 @@ class OpenaiApiASR(ASRBase):
         self.task = "translate"
 
 
-
-
-class HypothesisBuffer:
-
-    def __init__(self, logfile=sys.stderr):
-        self.commited_in_buffer = []
-        self.buffer = []
-        self.new = []
-
-        self.last_commited_time = 0
-        self.last_commited_word = None
-
-        self.logfile = logfile
-
-    def insert(self, new, offset):
-        # compare self.commited_in_buffer and new. It inserts only the words in new that extend the commited_in_buffer, it means they are roughly behind last_commited_time and new in content
-        # the new tail is added to self.new
-        
-        new = [(a+offset,b+offset,t) for a,b,t in new]
-        self.new = [(a,b,t) for a,b,t in new if a > self.last_commited_time-0.1]
-
-        if len(self.new) >= 1:
-            a,b,t = self.new[0]
-            if abs(a - self.last_commited_time) < 1:
-                if self.commited_in_buffer:
-                    # it's going to search for 1, 2, ..., 5 consecutive words (n-grams) that are identical in commited and new. If they are, they're dropped.
-                    cn = len(self.commited_in_buffer)
-                    nn = len(self.new)
-                    for i in range(1,min(min(cn,nn),5)+1):  # 5 is the maximum 
-                        c = " ".join([self.commited_in_buffer[-j][2] for j in range(1,i+1)][::-1])
-                        tail = " ".join(self.new[j-1][2] for j in range(1,i+1))
-                        if c == tail:
-                            words = []
-                            for j in range(i):
-                                words.append(repr(self.new.pop(0)))
-                            words_msg = " ".join(words)
-                            logger.debug(f"removing last {i} words: {words_msg}")
-                            break
-
-    def flush(self):
-        # returns commited chunk = the longest common prefix of 2 last inserts. 
-
-        commit = []
-        while self.new:
-            na, nb, nt = self.new[0]
-
-            if len(self.buffer) == 0:
-                break
-
-            if nt == self.buffer[0][2]:
-                commit.append((na,nb,nt))
-                self.last_commited_word = nt
-                self.last_commited_time = nb
-                self.buffer.pop(0)
-                self.new.pop(0)
-            else:
-                break
-        self.buffer = self.new
-        self.new = []
-        self.commited_in_buffer.extend(commit)
-        return commit
-
-    def pop_commited(self, time):
-        while self.commited_in_buffer and self.commited_in_buffer[0][1] <= time:
-            self.commited_in_buffer.pop(0)
-
-    def complete(self):
-        return self.buffer
-
 class OnlineASRProcessor:
 
     SAMPLING_RATE = 16000
 
-    def __init__(self, asr, tokenizer=None, buffer_trimming=("segment", 15), logfile=sys.stderr):
+    def __init__(self, asr, tokenizer=None, buffer_trimming=("segment", 15), agreement_iterations=2, logfile=sys.stderr):
         """asr: WhisperASR object
         tokenizer: sentence tokenizer object for the target language. Must have a method *split* that behaves like the one of MosesTokenizer. It can be None, if "segment" buffer trimming option is used, then tokenizer is not used at all.
         ("segment", 15)
         buffer_trimming: a pair of (option, seconds), where option is either "sentence" or "segment", and seconds is a number. Buffer is trimmed if it is longer than "seconds" threshold. Default is the most recommended option.
+        agreement_iterations: number of consecutive iterations required for local agreement (default: 2)
         logfile: where to store the log. 
         """
         self.asr = asr
         self.tokenizer = tokenizer
         self.logfile = logfile
+        self.agreement_iterations = agreement_iterations
 
         self.init()
 
@@ -445,7 +380,15 @@ class OnlineASRProcessor:
     def init(self, offset=None):
         """run this when starting or restarting processing"""
         self.audio_buffer = np.array([],dtype=np.float32)
-        self.transcript_buffer = HypothesisBuffer(logfile=self.logfile)
+        
+        # agreement_iterationsに基づいて適切なバッファクラスを選択
+        if self.agreement_iterations == 2:
+            # n=2の場合は最適化されたオリジナル実装を使用
+            self.transcript_buffer = HypothesisBuffer(logfile=self.logfile)
+        else:
+            # n>2の場合は拡張実装を使用
+            self.transcript_buffer = HypothesisBufferN(logfile=self.logfile, agreement_iterations=self.agreement_iterations)
+        
         self.buffer_time_offset = 0
         if offset is not None:
             self.buffer_time_offset = offset
@@ -777,6 +720,7 @@ def add_shared_args(parser):
     parser.add_argument('--vad', action="store_true", default=False, help='Use VAD = voice activity detection, with the default parameters.')
     parser.add_argument('--buffer_trimming', type=str, default="segment", choices=["sentence", "segment"],help='Buffer trimming strategy -- trim completed sentences marked with punctuation mark and detected by sentence segmenter, or the completed segments returned by Whisper. Sentence segmenter must be installed for "sentence" option.')
     parser.add_argument('--buffer_trimming_sec', type=float, default=15, help='Buffer trimming length threshold in seconds. If buffer length is longer, trimming sentence/segment is triggered.')
+    parser.add_argument('--agreement-iterations', type=int, default=2, dest='agreement_iterations', help='Number of consecutive iterations required for local agreement. Higher values increase stability but may increase latency (default: 2, minimum: 2).')
     parser.add_argument("-l", "--log-level", dest="log_level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], help="Set the log level", default='DEBUG')
 
 def asr_factory(args, logfile=sys.stderr):
@@ -808,6 +752,13 @@ def asr_factory(args, logfile=sys.stderr):
         logger.info("Setting VAD filter")
         asr.use_vad()
 
+    # 局所合意の回数を検証
+    if args.agreement_iterations < 2:
+        logger.warning(f"agreement_iterations must be at least 2, got {args.agreement_iterations}. Setting to 2.")
+        args.agreement_iterations = 2
+    elif args.agreement_iterations > 2:
+        logger.info(f"Using {args.agreement_iterations} iterations for local agreement (may increase latency)")
+
     language = args.lan
     if args.task == "translate":
         asr.set_translate_task()
@@ -824,9 +775,9 @@ def asr_factory(args, logfile=sys.stderr):
     # Create the OnlineASRProcessor
     if args.vac:
         
-        online = VACOnlineASRProcessor(args.min_chunk_size, asr,tokenizer,logfile=logfile,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec))
+        online = VACOnlineASRProcessor(args.min_chunk_size, asr,tokenizer,logfile=logfile,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec), agreement_iterations=args.agreement_iterations)
     else:
-        online = OnlineASRProcessor(asr,tokenizer,logfile=logfile,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec))
+        online = OnlineASRProcessor(asr,tokenizer,logfile=logfile,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec), agreement_iterations=args.agreement_iterations)
 
     return asr, online
 
